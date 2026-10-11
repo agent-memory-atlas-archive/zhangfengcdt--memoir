@@ -23,7 +23,9 @@ const TIMEOUT_MS = 10_000
 // A merge or a write on a large store can take a while; a kill mid-merge
 // would leave the store on main.
 const WRITE_TIMEOUT_MS = 180_000
-const LOG_WINDOW = 20
+// How many commits the Recent tab reads: on main the latest ten, on a branch up to twenty of its own.
+const MAIN_LOG_WINDOW = 10
+const BRANCH_LOG_WINDOW = 20
 
 async function exec(host: Host, argv: readonly string[], cwd?: string, timeoutMs = TIMEOUT_MS): Promise<ProcessRunResult | null> {
   try {
@@ -83,17 +85,51 @@ export async function fingerprint(host: Host, store: string): Promise<string> {
   const head = await readHead(host, store)
   const headMtime = await mtime(host, `${store}/.git/HEAD`)
   const refMtime = head.ref ? await mtime(host, `${store}/.git/${head.ref}`) : 0
-  const packedMtime = refMtime ? 0 : await mtime(host, `${store}/.git/packed-refs`)
-  return `${head.branch ?? ''}:${headMtime}:${refMtime}:${packedMtime}`
+  // Off main the view compares with main, so main moving (another worktree
+  // or process merging this branch, say) must redraw it too.
+  const mainMtime = head.branch && head.branch !== 'main' ? await mtime(host, `${store}/.git/refs/heads/main`) : 0
+  const packedMtime = refMtime && (mainMtime || head.branch === 'main') ? 0 : await mtime(host, `${store}/.git/packed-refs`)
+  return `${head.branch ?? ''}:${headMtime}:${refMtime}:${mainMtime}:${packedMtime}`
 }
 
-export async function readLog(host: Host, store: string): Promise<ParsedLog> {
-  const out = await run(host, ['git', '-C', store, 'log', '--format=%H%x09%ct%x09%s', '-n', String(LOG_WINDOW)])
+/** Which commits the Recent tab lists: on a branch, those not on `base` (after `since`, when main took a merge of the branch). */
+export type LogScope = { base: string | null; since: string | null }
+
+export async function readLog(host: Host, store: string, scope: LogScope = { base: null, since: null }): Promise<ParsedLog> {
+  const range = scope.since ? ['HEAD', `--after=${scope.since}`] : scope.base ? [`${scope.base}..HEAD`] : []
+  const window = scope.base || scope.since ? BRANCH_LOG_WINDOW : MAIN_LOG_WINDOW
+  const out = await run(host, ['git', '-C', store, 'log', ...range, '--format=%H%x09%ct%x09%s', '-n', String(window)])
   return out ? parseLog(out) : { order: [], entries: [] }
 }
 
-export async function countCommits(host: Host, store: string): Promise<number | null> {
-  const out = await run(host, ['git', '-C', store, 'rev-list', '--count', 'HEAD'])
+/**
+ * When `base` last took a merge of `branch`, as an ISO time, else null. A
+ * memoir merge commit has one parent, so `base..HEAD` keeps listing the
+ * merged commits; after that time only the branch's later commits count.
+ */
+export async function mergedAt(host: Host, store: string, base: string, branch: string): Promise<string | null> {
+  const out = await run(host, [
+    'git', '-C', store, 'log', base, '-n', '1', '--format=%cI', '--fixed-strings',
+    `--grep=Merge branch '${branch}' into ${base}`,
+  ])
+  const at = out?.trim()
+  return at ? at : null
+}
+
+/**
+ * How many commits the Recent tab's scope holds: on a branch, those on top
+ * of main; on main, all of them. With `metrics` false the machine-written
+ * `metrics.*` commits are left out, as the tab leaves them out by default.
+ */
+export async function countCommits(
+  host: Host,
+  store: string,
+  scope: LogScope = { base: null, since: null },
+  metrics = true,
+): Promise<number | null> {
+  const range = scope.since ? ['HEAD', `--after=${scope.since}`] : scope.base ? [`${scope.base}..HEAD`] : ['HEAD']
+  const filter = metrics ? [] : ['--invert-grep', '--grep=^Store metrics\\.', '--grep=^Delete metrics\\.']
+  const out = await run(host, ['git', '-C', store, 'rev-list', '--count', ...filter, ...range])
   const n = Number(out?.trim())
   return out && Number.isFinite(n) ? n : null
 }
@@ -155,29 +191,19 @@ export async function readTaxonomy(host: Host, store: string): Promise<Record<st
 }
 
 /**
- * Which keys this branch wrote since it left main (`main..HEAD`), and which
- * keys main's own history has ever stored: enough to tell what the branch
- * added or changed, from git metadata alone. Never `memoir get --branch`:
- * the CLI routes that by checking main out and back, and a Stop-hook write
- * in that window lands on main. Null when main cannot be compared.
- *
- * A memoir merge commit on main has one parent, so `main..HEAD` keeps
- * listing the merged commits; after the latest merge of this branch into
- * main only the branch's later writes count.
+ * Which keys this branch wrote since it left main (`main..HEAD`, or after
+ * `since` once main took a merge of the branch), and which keys main's own
+ * history has ever stored: enough to tell what the branch added or changed,
+ * from git metadata alone. Never `memoir get --branch`: the CLI routes that
+ * by checking main out and back, and a Stop-hook write in that window lands
+ * on main. Null when main cannot be compared.
  */
 export async function readBranchDiff(
   host: Host,
   store: string,
   base: string,
+  since: string | null,
 ): Promise<{ written: Set<string>; onBase: Set<string> } | null> {
-  const head = await readHead(host, store)
-  const mergedAt = head.branch
-    ? await run(host, [
-        'git', '-C', store, 'log', base, '-n', '1', '--format=%cI', '--fixed-strings',
-        `--grep=Merge branch '${head.branch}' into ${base}`,
-      ])
-    : null
-  const since = mergedAt?.trim()
   const written = since
     ? await run(host, ['git', '-C', store, 'log', 'HEAD', `--after=${since}`, '--format=%s'])
     : await run(host, ['git', '-C', store, 'log', `${base}..HEAD`, '--format=%s'])

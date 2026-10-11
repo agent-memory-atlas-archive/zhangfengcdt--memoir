@@ -86,11 +86,15 @@ type World = {
   exists: boolean
   log: string
   count: string
+  /** `rev-list --count` without the metrics writes. */
+  countNoMetrics: string
   cache: string
   head: string
   settings: Record<string, unknown>
   surfaces: string[]
   mtime: number
+  /** mtime of `refs/heads/main`, watched while off main. */
+  mainMtime: number
   placed: boolean
   cliFails: boolean
   /** A memoir CLI that predates key-level diffs: `diff` answers without `changes`. */
@@ -108,11 +112,13 @@ function world(on: On, overrides: Partial<World> = {}) {
     exists: true,
     log: BASE_LOG,
     count: '61\n',
+    countNoMetrics: '61\n',
     cache: '18\n',
     head: 'ref: refs/heads/main\n',
     settings: {},
     surfaces: ['terminal'],
     mtime: 1000,
+    mainMtime: 500,
     placed: true,
     cliFails: false,
     oldCli: false,
@@ -129,7 +135,9 @@ function world(on: On, overrides: Partial<World> = {}) {
   on('session.surfaces', () => ({ value: w.surfaces as never }))
   on('ui.open', () => ({ value: (w.placed ? { isPlaced: true } : { isPlaced: false, reason: 'narrow' }) as never }))
   on('fs.exists', () => ({ value: w.exists }))
-  on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: w.mtime, isLink: false } }))
+  on('fs.stat', ($, e) => ({
+    value: { kind: 'file', size: 1, mtimeMs: e.path.endsWith('refs/heads/main') ? w.mainMtime : w.mtime, isLink: false },
+  }))
   on('fs.read', ($, e) => ({
     value: e.path.endsWith('/HEAD') ? w.head : e.path.endsWith('plugin-statusline-cache') ? w.cache : '',
   }))
@@ -141,12 +149,12 @@ function world(on: On, overrides: Partial<World> = {}) {
     if (argv.includes('derive-store-path.sh')) {
       stdout = w.store ?? ''
       exitCode = w.store === null ? 1 : 0
-    } else if (argv.includes('--grep=')) stdout = w.mergedAt
-    else if (argv.includes('--after=')) stdout = w.afterMerge
-    else if (argv.includes('main..HEAD')) stdout = BRANCH_SUBJECTS
+    } else if (argv.includes('rev-list')) stdout = argv.includes('--invert-grep') ? w.countNoMetrics : w.count
+    else if (argv.includes('--grep=')) stdout = w.mergedAt
+    else if (argv.includes('--after=')) stdout = argv.includes('--format=%s') ? w.afterMerge : w.log
+    else if (argv.includes('main..HEAD')) stdout = argv.includes('--format=%s') ? BRANCH_SUBJECTS : w.log
     else if (argv.includes(' log main ')) stdout = MAIN_SUBJECTS
     else if (argv.includes(' log ')) stdout = w.log
-    else if (argv.includes('rev-list')) stdout = w.count
     else if (argv.includes(' get ') && w.cliFails) exitCode = 1
     else if (argv.includes(' get ')) {
       const keys = e.argv.slice(e.argv.indexOf('get') + 3)
@@ -260,10 +268,18 @@ test('newCount counts non-metric captures ahead of the turn baseline', () => {
 })
 
 test('hintTail and textSummary', () => {
-  const status = { store: STORE, branch: 'main', head: sha(3), memories: 18, commits: 61 }
+  const status = { store: STORE, branch: 'main', head: sha(3), memories: 18, commits: 61, commitsWithoutMetrics: 40 }
+  expect(fmt.commitsLabel(status, false)).toBe('40 commits')
+  expect(fmt.commitsLabel({ ...status, branch: 'feat/x' }, false)).toBe('+40 changes')
+  expect(fmt.commitsLabel({ ...status, commitsWithoutMetrics: null }, false)).toBe('61 commits')
+  // The plain-text summary lists non-metric commits, so its count leaves metrics out.
+  expect(fmt.textSummary({ ...status, branch: 'feat/x' }, [], 0)).toContain('memoir: feat/x · 18 memories · +40 changes')
   expect(fmt.hintTail(status, 0)).toBe('memoir: main · 18 memories')
   expect(fmt.hintTail(status, 2)).toBe('memoir: main · 18 memories · +2 this turn')
   expect(fmt.hintTail({ ...status, memories: 1 }, 0)).toBe('memoir: main · 1 memory')
+  expect(fmt.statusLine({ ...status, branch: 'feat/x', commits: 3 })).toBe('feat/x · 18 memories · +3 changes')
+  expect(fmt.statusLine({ ...status, branch: 'feat/x', commits: 1 })).toBe('feat/x · 18 memories · +1 change')
+  expect(fmt.statusLine({ ...status, branch: 'feat/x', commits: null })).toBe('feat/x · 18 memories')
   expect(fmt.hintTail({ ...status, store: null }, 0)).toBeUndefined()
   expect(fmt.textSummary({ ...status, store: null }, [], 0)).toBe('No memoir store for this folder.')
   expect(fmt.usesStatuslineScript({ statusLine: { type: 'command', command: 'x | bash ~/p/scripts/statusline.sh' } })).toBe(true)
@@ -335,7 +351,7 @@ test('non-drawing surface: /memoir:pane prints a plain-text summary', async ($, 
 })
 
 test('pane: recent feed hides metrics until toggled; t shows the taxonomy above the keys', async ($, on) => {
-  await boot($, on)
+  const { w } = await boot($, on)
   const ran = await runCommand($)
   expect(ran.text).toBe('memoir pane opened.')
 
@@ -346,10 +362,15 @@ test('pane: recent feed hides metrics until toggled; t shows the taxonomy above 
   expect(await ui.find({ type: 'Button', key: `commit-${sha(0)}`, text: /Initialize memoir store/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Run make format/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: `commit-${sha(3)}` })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'main · 18 memories · 61 commits' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'status-branch', text: 'main' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'status-memories', text: '18 memories' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'status-commits', text: '61 commits' })).toBeDefined()
 
   await ui.press({ key: 'metrics' })
   expect(await ui.find({ type: 'Button', key: `commit-${sha(3)}`, text: /metrics\.turn\.main/ })).toBeDefined()
+  // On main the tab reads the latest ten commits.
+  const log = w.runs.find(argv => argv.includes('--format=%H%x09%ct%x09%s'))
+  expect(log!.slice(log!.indexOf('log'))).toEqual(['log', '--format=%H%x09%ct%x09%s', '-n', '10'])
   await ui.press({ key: 'metrics' })
 
   await ui.press({ key: 'tab-memories' })
@@ -482,7 +503,7 @@ test('memories tab (the default): on a branch only the keys that differ from mai
   // Main is read through the CLI's key-level diff: never `get --branch` (the CLI would check main out).
   expect(w.runs.some(argv => argv.includes('diff') && argv.includes('main') && argv.includes('HEAD'))).toBe(true)
   expect(w.runs.some(argv => argv.includes('--branch'))).toBe(false)
-  expect(w.runs.some(argv => argv.includes('main..HEAD'))).toBe(false)
+  expect(w.runs.some(argv => argv.includes('main..HEAD') && argv.includes('--format=%s'))).toBe(false)
 
   await ui.input({ key: 'filter', text: 'BUILD', kind: 'change' })
   expect(await ui.find({ type: 'Button', key: 'mem-knowledge.technical.build' })).toBeDefined()
@@ -651,4 +672,70 @@ test('a commit on a memoir without key-level diffs shows the key\'s current valu
   expect(await ui.find({ type: 'Text', text: 'workflow.coding.gates now:' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^  Run make format, make lint/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /needs a memoir with key-level diffs/ })).toBeDefined()
+})
+
+test('recent tab on a branch lists only the commits not on main', async ($, on) => {
+  const { w, clock } = await boot($, on, { head: 'ref: refs/heads/feat/x\n' })
+  const log = w.runs.find(argv => argv.includes('log') && argv.includes('--format=%H%x09%ct%x09%s'))
+  expect(log!.slice(log!.indexOf('log'))).toEqual(['log', 'main..HEAD', '--format=%H%x09%ct%x09%s', '-n', '20'])
+  const count = w.runs.find(argv => argv.includes('rev-list'))
+  expect(count!.slice(count!.indexOf('rev-list'))).toEqual(['rev-list', '--count', 'main..HEAD'])
+  let ui = await $.ui.mount(PANE)
+  // The header counts what sits on top of main.
+  expect(await ui.find({ type: 'Button', key: 'status-commits', text: '+61 changes' })).toBeDefined()
+  await ui.press({ key: 'tab-recent' })
+  expect(await ui.find({ type: 'Text', text: /^commits not on main/ })).toBeDefined()
+
+  // Everything merged into main: the branch has nothing of its own to list.
+  w.mergedAt = '2023-11-14T22:15:00+00:00\n'
+  w.log = ''
+  w.mtime = 2000
+  await ui.unmount()
+  await clock.advance(3000)
+  const after = w.runs.filter(argv => argv.includes('--after=2023-11-14T22:15:00+00:00') && argv.includes('--format=%H%x09%ct%x09%s'))
+  expect(after.length).toBeGreaterThan(0)
+  ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'tab-recent' })
+  expect(await ui.find({ type: 'Text', text: 'Nothing beyond main yet.' })).toBeDefined()
+})
+
+test('the header status is three shortcuts: branch to Metrics, memories to Memories, commits to Recent', async ($, on) => {
+  await boot($, on)
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'status-branch' })
+  expect(await ui.find({ type: 'Text', text: 'Turns' })).toBeDefined()
+  await ui.press({ key: 'status-commits' })
+  expect(await ui.find({ type: 'Button', key: `commit-${sha(2)}` })).toBeDefined()
+  await ui.press({ key: 'status-memories' })
+  expect(await ui.find({ type: 'Button', key: 'mem-workflow.coding.gates' })).toBeDefined()
+})
+
+test('the header count leaves metrics writes out while the Recent tab hides them', async ($, on) => {
+  const { w } = await boot($, on, { head: 'ref: refs/heads/feat/x\n', count: '6\n', countNoMetrics: '1\n' })
+  const filtered = w.runs.find(argv => argv.includes('rev-list') && argv.includes('--invert-grep'))
+  expect(filtered!.slice(filtered!.indexOf('rev-list'))).toEqual([
+    'rev-list', '--count', '--invert-grep', '--grep=^Store metrics\\.', '--grep=^Delete metrics\\.', 'main..HEAD',
+  ])
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Button', key: 'status-commits', text: '+1 change' })).toBeDefined()
+  await ui.press({ key: 'tab-recent' })
+  await ui.press({ key: 'metrics' })
+  expect(await ui.find({ type: 'Button', key: 'status-commits', text: '+6 changes' })).toBeDefined()
+})
+
+test('off main, main moving (another process merging the branch) refreshes the view', async ($, on) => {
+  const { w, clock } = await boot($, on, { head: 'ref: refs/heads/feat/x\n', count: '6\n', countNoMetrics: '1\n' })
+  const before = w.runs.filter(argv => argv.includes('rev-list')).length
+  // Nothing moved: a poll runs no git.
+  await clock.advance(3000)
+  expect(w.runs.filter(argv => argv.includes('rev-list')).length).toBe(before)
+  // main took the branch: its ref is rewritten while HEAD and the branch ref stay.
+  w.mainMtime = 900
+  w.mergedAt = '2023-11-14T22:15:00+00:00\n'
+  w.count = '0\n'
+  w.countNoMetrics = '0\n'
+  await clock.advance(3000)
+  expect(w.runs.filter(argv => argv.includes('rev-list')).length).toBeGreaterThan(before)
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Button', key: 'status-commits', text: '+0 changes' })).toBeDefined()
 })

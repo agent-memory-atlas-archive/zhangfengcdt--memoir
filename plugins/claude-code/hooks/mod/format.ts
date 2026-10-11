@@ -95,11 +95,23 @@ export function plural(n: number, one: string, many: string): string {
 }
 
 /** `main · 18 memories · 61 commits`, dropping what is unknown. */
-export function statusLine(status: MemoirStatus): string {
+/**
+ * The commit count's label: on a branch the count is what sits on top of
+ * main, so it reads `+N changes`. While metrics are hidden the count leaves
+ * the `metrics.*` writes out, so it matches what the Recent tab lists.
+ */
+export function commitsLabel(status: MemoirStatus, showMetrics = true): string | null {
+  const n = showMetrics ? status.commits : (status.commitsWithoutMetrics ?? status.commits)
+  if (n === null) return null
+  return status.branch && status.branch !== 'main' ? `+${plural(n, 'change', 'changes')}` : plural(n, 'commit', 'commits')
+}
+
+export function statusLine(status: MemoirStatus, showMetrics = true): string {
   const parts: string[] = []
   if (status.branch) parts.push(status.branch)
   if (status.memories !== null) parts.push(plural(status.memories, 'memory', 'memories'))
-  if (status.commits !== null) parts.push(plural(status.commits, 'commit', 'commits'))
+  const commits = commitsLabel(status, showMetrics)
+  if (commits !== null) parts.push(commits)
   return parts.join(' · ')
 }
 
@@ -190,7 +202,8 @@ export function textSummary(
   limit = 10,
 ): string {
   if (!status.store) return 'No memoir store for this folder.'
-  const lines = [`memoir: ${statusLine(status)}`]
+  // The list below leaves metrics writes out, so the count does too.
+  const lines = [`memoir: ${statusLine(status, false)}`]
   const shown = visibleCaptures(captures, false).slice(0, limit)
   if (shown.length === 0) {
     lines.push('No captures yet.')
