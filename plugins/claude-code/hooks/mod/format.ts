@@ -357,6 +357,9 @@ export function wrapText(text: string, width: number, max: number): string[] {
 
 export const MARKS: Record<MemoirMemory['status'], string> = { added: '+', changed: '~', removed: '-', same: ' ' }
 
+/** The memoir mark in three rows of box drawing: the logo's arch over its two loops. */
+export const LOGO: readonly string[] = [' ┏━━━━━┓ ', '┏┛┏┓ ┏┓┗┓', '┗━┛┗━┛┗━┛']
+
 export type MemoryAction = { verb: string; kind: MemoirMemoryAction; hotkey: string }
 
 /**
@@ -375,4 +378,21 @@ export function memoryActions(m: MemoirMemory, base: string | null): MemoryActio
     })
   }
   return actions
+}
+
+/** Another branch's differences from main, from the CLI's key-level diff: both values known. */
+export function itemsFromChanges(changes: Iterable<MemoirKeyChange>): MemoirMemory[] {
+  const items: MemoirMemory[] = []
+  for (const c of changes) {
+    const status: MemoirMemory['status'] = c.operation === 'added' ? 'added' : c.operation === 'removed' ? 'removed' : 'changed'
+    items.push({ key: c.key, content: c.new, base: c.old, status })
+  }
+  return items.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+}
+
+/** Another branch's differences from main, from git history alone: which keys it wrote, no values. */
+export function itemsFromHistory(history: { written: ReadonlySet<string>; onBase: ReadonlySet<string> }): MemoirMemory[] {
+  return [...history.written]
+    .sort()
+    .map(key => ({ key, content: null, base: null, status: history.onBase.has(key) ? 'changed' : 'added' }))
 }
