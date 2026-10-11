@@ -1,0 +1,467 @@
+// The pane's tree, built from plain values the render hook read: no `$` here,
+// so the layout is a pure function of the view.
+
+import type { EngineInterface, RenderElement } from 'claude-code'
+
+import type {
+  MemoirCapture,
+  MemoirCommitDetail,
+  MemoirMemories,
+  MemoirMemory,
+  MemoirMemoryAction,
+  MemoirMergeState,
+  MemoirMergeStrategy,
+  MemoirStatus,
+  MemoirTab,
+  MemoirTurnMetrics,
+} from '../../types'
+import * as fmt from './format'
+
+export type PaneView = {
+  elements: ReturnType<EngineInterface['ui']['resolve']>
+  width: number
+  rows: number
+  now: number
+  status: MemoirStatus
+  captures: readonly MemoirCapture[]
+  order: readonly string[]
+  tab: MemoirTab
+  showMetrics: boolean
+  showTaxonomy: boolean
+  baseline: string | null
+  taxonomy: Readonly<Record<string, number>>
+  metrics: Readonly<Record<string, MemoirTurnMetrics>>
+  memories: MemoirMemories
+  filter: string
+  /** The key whose detail is open, or null for the list. */
+  selected: string | null
+  /** The detail action pressed once, awaiting `y`; null when none. */
+  armed: MemoirMemoryAction | null
+  merge: MemoirMergeState
+  commit: string | null
+  commitDetail: MemoirCommitDetail | null
+  expanded: readonly string[]
+  actions: {
+    pickTab: (tab: MemoirTab) => unknown
+    toggleMetrics: () => unknown
+    toggleTaxonomy: () => unknown
+    setFilter: (text: string) => unknown
+    select: (key: string | null) => unknown
+    arm: (kind: MemoirMemoryAction) => unknown
+    disarm: () => unknown
+    apply: (m: MemoirMemory, kind: MemoirMemoryAction) => unknown
+    openCommit: (sha: string | null) => unknown
+    openMerge: () => unknown
+    cancelMerge: () => unknown
+    runMerge: (strategy: MemoirMergeStrategy) => unknown
+    toggleGroup: (name: string) => unknown
+    refresh: () => unknown
+  }
+}
+
+/** What happens to a key changed on both sides: the CLI's `merge -S ours|theirs`, or both values kept. */
+const STRATEGIES: { strategy: MemoirMergeStrategy; hotkey: string; what: string }[] = [
+  { strategy: 'ours', hotkey: 'o', what: "keep main's value" },
+  { strategy: 'theirs', hotkey: 't', what: "take this branch's value" },
+  { strategy: 'both', hotkey: 'b', what: "keep main's value and append this branch's" },
+]
+
+const MARK_COLOR: Record<MemoirMemory['status'], string | undefined> = {
+  added: 'diffAdded',
+  changed: 'warning',
+  removed: 'diffRemoved',
+  same: undefined,
+}
+
+const AGE_WIDTH = 11
+const INDENT = ' '.repeat(AGE_WIDTH + 3)
+
+export function renderPane(view: PaneView): RenderElement {
+  const { Box, Text, Button } = view.elements
+  // The mobile app draws no field yet: there the filter row is left out.
+  const Input = 'Input' in view.elements ? view.elements.Input : null
+  const { status, actions } = view
+  const width = Math.max(20, view.width)
+  const rows = Math.max(6, view.rows)
+  const open = new Set(view.expanded)
+
+  const header = (
+    <Box justifyContent="space-between" gap={2}>
+      <Box gap={2}>
+        <Button key="tab-memories" plain hotkey="1" dimColor={view.tab === 'recent' || view.tab === 'metrics'} onPress={() => void actions.pickTab('memories')}>
+          Memories
+        </Button>
+        <Button key="tab-recent" plain hotkey="2" dimColor={view.tab !== 'recent'} onPress={() => void actions.pickTab('recent')}>
+          Recent
+        </Button>
+        <Button key="tab-metrics" plain hotkey="3" dimColor={view.tab !== 'metrics'} onPress={() => void actions.pickTab('metrics')}>
+          Metrics
+        </Button>
+      </Box>
+      <Text dimColor wrap="truncate-start">
+        {fmt.statusLine(status)}
+      </Text>
+    </Box>
+  )
+
+  const metricsButton = (
+    <Button key="metrics" plain hotkey="m" dimColor onPress={() => void actions.toggleMetrics()}>
+      {`show metrics (${view.showMetrics ? 'on' : 'off'})`}
+    </Button>
+  )
+  const refreshButton = (
+    <Button key="refresh" plain hotkey="r" dimColor onPress={() => void actions.refresh()}>
+      refresh
+    </Button>
+  )
+
+  let body: RenderElement
+  let footer: RenderElement
+  if (!status.store) {
+    body = <Text dimColor>No memoir store for this folder.</Text>
+    footer = refreshButton
+  } else if (view.tab === 'recent') {
+    const fresh = fmt.newShas(view.order, view.baseline)
+    const shown = fmt.visibleCaptures(view.captures, view.showMetrics)
+    const open = view.commit === null ? undefined : view.captures.find(c => c.sha === view.commit)
+    if (open) {
+      // One commit: when it happened, and what it changed (both values from
+      // the CLI's key-level diff), else the key's value as it is now.
+      const detail = view.commitDetail?.sha === open.sha ? view.commitDetail : null
+      const textWidth = Math.max(8, width - 2)
+      const block = (text: string | null, sign: string, color: string | undefined) =>
+        (text === null ? ['(content unavailable)'] : fmt.wrapText(text, textWidth, 200)).map(line => (
+          <Text color={color} dimColor={text === null}>
+            {`${sign} ${line}`}
+          </Text>
+        ))
+      const changes = detail?.changes ?? null
+      body = (
+        <Box flexDirection="column">
+          <Box>
+            {fresh.has(open.sha) ? <Text color="success">● </Text> : <Text dimColor>○ </Text>}
+            <Text bold>{open.subject}</Text>
+          </Box>
+          <Text dimColor>{`${open.sha.slice(0, 8)} · ${fmt.absoluteTime(open.at)} · ${fmt.relativeTime(view.now, open.at)}`}</Text>
+          <Text> </Text>
+          {detail === null ? (
+            <Text dimColor>reading the commit…</Text>
+          ) : changes === null ? (
+            <Box flexDirection="column">
+              {open.kind === 'store' ? (
+                <Box flexDirection="column">
+                  <Text dimColor>{`${open.key} now:`}</Text>
+                  {block(open.content, ' ', undefined)}
+                  <Text> </Text>
+                  <Text dimColor>The change itself needs a memoir with key-level diffs; this is the key's current value.</Text>
+                </Box>
+              ) : (
+                <Text dimColor>The change itself needs a memoir with key-level diffs.</Text>
+              )}
+            </Box>
+          ) : changes.length === 0 ? (
+            <Text dimColor>No memory changed in this commit.</Text>
+          ) : (
+            <Box flexDirection="column">
+              {changes.map(c => (
+                <Box flexDirection="column" marginBottom={1}>
+                  <Box>
+                    <Text color={c.operation === 'added' ? 'diffAdded' : c.operation === 'removed' ? 'diffRemoved' : 'warning'}>
+                      {`${c.operation === 'added' ? '+' : c.operation === 'removed' ? '-' : '~'} `}
+                    </Text>
+                    <Text bold>{c.key}</Text>
+                  </Box>
+                  {c.operation === 'added' ? [] : block(c.old, '-', 'diffRemoved')}
+                  {c.operation === 'removed' ? [] : block(c.new, '+', 'diffAdded')}
+                </Box>
+              ))}
+            </Box>
+          )}
+        </Box>
+      )
+      footer = (
+        <Box justifyContent="space-between">
+          <Button key="back" plain hotkey="b" dimColor onPress={() => void actions.openCommit(null)}>
+            back
+          </Button>
+          {refreshButton}
+        </Box>
+      )
+    } else {
+      const limit = Math.max(1, Math.floor((rows - 3) / 3))
+      body =
+        shown.length === 0 ? (
+          <Text dimColor>No commits yet.</Text>
+        ) : (
+          <Box flexDirection="column">
+            {shown.slice(0, limit).map(c => {
+              const isNew = fresh.has(c.sha)
+              const lines =
+                c.kind !== 'store' ? [] : c.content ? fmt.wrapLines(c.content, width - INDENT.length, 2) : ['(content unavailable)']
+              return (
+                <Box flexDirection="column" marginBottom={1}>
+                  <Button key={`commit-${c.sha}`} plain onPress={() => void actions.openCommit(c.sha)}>
+                    {isNew ? <Text color="success">●</Text> : <Text dimColor>○</Text>}
+                    <Text dimColor>{` ${fmt.relativeTime(view.now, c.at).padEnd(AGE_WIDTH)} `}</Text>
+                    <Text bold>{c.subject}</Text>
+                  </Button>
+                  {lines.map(line => (
+                    <Text dimColor>
+                      {INDENT}
+                      {line}
+                    </Text>
+                  ))}
+                </Box>
+              )
+            })}
+          </Box>
+        )
+      footer = (
+        <Box justifyContent="space-between">
+          <Box gap={3}>
+            <Text dimColor>Enter/click a commit for its change</Text>
+            {metricsButton}
+          </Box>
+          {refreshButton}
+        </Box>
+      )
+    }
+  } else if (view.tab !== 'metrics') {
+    const { items, base } = view.memories
+    // Machine-written `metrics.*` keys have their own tab; this one is for memories.
+    const visible = fmt.visibleCaptures(items, false)
+    const here = visible.filter(m => m.status !== 'removed')
+    const differing = visible.filter(m => m.status !== 'same')
+    const summary =
+      base === null
+        ? `${fmt.plural(here.length, 'memory', 'memories')}${status.branch === 'main' ? ' on main' : ' · no main branch to compare'}`
+        : `${fmt.plural(here.length, 'memory', 'memories')} · ${differing.length === 1 ? '1 differs' : `${differing.length} differ`} from ${base}`
+    const current = view.selected === null ? undefined : visible.find(m => m.key === view.selected)
+
+    if (current) {
+      // One key: its value, or both values when main's differs, and the one
+      // write the person can ask for (behind a second press).
+      const available = fmt.memoryActions(current, base)
+      const pending = view.armed === null ? undefined : available.find(a => a.kind === view.armed)
+      const textWidth = Math.max(8, width - 2)
+      const block = (text: string | null, sign: string, color: string | undefined) =>
+        (text === null ? ['(content unavailable)'] : fmt.wrapText(text, textWidth, 200)).map(line => (
+          <Text color={color} dimColor={text === null}>
+            {`${sign} ${line}`}
+          </Text>
+        ))
+      const branch = status.branch ?? 'this branch'
+      const explain =
+        current.status === 'added'
+          ? `new on ${branch}, not on ${base}`
+          : current.status === 'changed'
+            ? `changed on ${branch}; ${base} holds another value`
+            : current.status === 'removed'
+              ? `on ${base} only; forgotten on ${branch}`
+              : base === null
+                ? `on ${branch}`
+                : `same on ${branch} and ${base}`
+      body = (
+        <Box flexDirection="column">
+          <Box>
+            <Text color={MARK_COLOR[current.status]}>{`${fmt.MARKS[current.status]} `}</Text>
+            <Text bold>{current.key}</Text>
+          </Box>
+          <Text dimColor>{explain}</Text>
+          <Text> </Text>
+          {current.status === 'changed' || current.status === 'removed' ? (
+            <Box flexDirection="column">
+              <Text dimColor>{`${base}:`}</Text>
+              {block(current.base, '-', 'diffRemoved')}
+            </Box>
+          ) : (
+            []
+          )}
+          {current.status === 'changed' ? <Text> </Text> : []}
+          {current.status === 'removed' ? (
+            []
+          ) : (
+            <Box flexDirection="column">
+              {current.status === 'same' ? [] : <Text dimColor>{`${branch}:`}</Text>}
+              {block(current.content, current.status === 'same' ? ' ' : '+', current.status === 'same' ? undefined : 'diffAdded')}
+            </Box>
+          )}
+          {(current.status === 'changed' || current.status === 'removed') && current.base === null ? (
+            <Text dimColor>{`${base}'s value could not be read: update memoir for key-level diffs.`}</Text>
+          ) : (
+            []
+          )}
+        </Box>
+      )
+      footer = (
+        <Box justifyContent="space-between">
+          <Box gap={3}>
+            <Button key="back" plain hotkey="b" dimColor onPress={() => void actions.select(null)}>
+              back
+            </Button>
+            {pending ? (
+              <Box gap={3}>
+                <Button key="confirm" plain hotkey="y" onPress={() => void actions.apply(current, pending.kind)}>
+                  {`confirm: ${pending.verb}`}
+                </Button>
+                <Button key="cancel" plain hotkey="n" dimColor onPress={() => void actions.disarm()}>
+                  cancel
+                </Button>
+              </Box>
+            ) : (
+              available.map(a => (
+                <Button key={`act-${a.kind}`} plain hotkey={a.hotkey} dimColor onPress={() => void actions.arm(a.kind)}>
+                  {a.verb}
+                </Button>
+              ))
+            )}
+          </Box>
+          {refreshButton}
+        </Box>
+      )
+    } else if (view.merge === 'running') {
+      body = <Text dimColor>{`Merging ${status.branch} into ${base}…`}</Text>
+      footer = <Text dimColor>the store is on main for a moment; it comes back by itself</Text>
+    } else if (view.merge === 'choose') {
+      body = (
+        <Box flexDirection="column">
+          <Text>{`Merge ${status.branch} into ${base}: ${differing.length === 1 ? '1 key differs' : `${differing.length} keys differ`}.`}</Text>
+          <Text dimColor>Keys changed only here are applied either way; pick what to do with a key changed on both sides.</Text>
+          <Text> </Text>
+          {STRATEGIES.map(s => (
+            <Button key={`strategy-${s.strategy}`} plain hotkey={s.hotkey} onPress={() => void actions.runMerge(s.strategy)}>
+              {`${s.strategy.padEnd(7)}`}
+              <Text dimColor>{s.what}</Text>
+            </Button>
+          ))}
+        </Box>
+      )
+      footer = (
+        <Button key="merge-cancel" plain hotkey="n" dimColor onPress={() => void actions.cancelMerge()}>
+          cancel
+        </Button>
+      )
+    } else {
+      // Off main only what differs; on main (nothing to compare) every key.
+      const shown = fmt.filterMemories(base === null ? visible : differing, view.filter)
+      const keyWidth = Math.min(40, Math.max(8, ...shown.map(m => m.key.length)))
+      const snippetWidth = Math.max(8, width - 2 - keyWidth - 2)
+      const groups = view.showTaxonomy ? fmt.groupTaxonomy(view.taxonomy, false) : []
+      body = (
+        <Box flexDirection="column">
+          <Text dimColor>{summary}</Text>
+          {view.showTaxonomy ? (
+            <Box flexDirection="column" marginBottom={1}>
+              {groups.length === 0 ? (
+                <Text dimColor>No taxonomy yet.</Text>
+              ) : (
+                groups.map(g => (
+                  <Box flexDirection="column">
+                    <Button key={`group-${g.name}`} plain onPress={() => void actions.toggleGroup(g.name)}>
+                      {`${open.has(g.name) ? '▾' : '▸'} ${g.name.padEnd(12)} ${g.count}`}
+                    </Button>
+                    {open.has(g.name) ? g.leaves.map(leaf => <Text dimColor>{`    ${leaf.path}`}</Text>) : []}
+                  </Box>
+                ))
+              )}
+            </Box>
+          ) : (
+            []
+          )}
+          {Input ? (
+            <Input
+              key="filter"
+              label="filter:"
+              placeholder="type part of a key"
+              value={view.filter}
+              submitLabel="apply"
+              onInput={(text: string) => void actions.setFilter(text)}
+              onSubmit={(text: string) => void actions.setFilter(text)}
+            />
+          ) : (
+            []
+          )}
+          {shown.length === 0 ? (
+            <Text dimColor>
+              {visible.length === 0 ? 'No memories yet.' : view.filter.trim() ? `No key contains "${view.filter.trim()}".` : `Nothing differs from ${base}.`}
+            </Text>
+          ) : (
+            shown.map(m => {
+              const snippet = m.content ?? m.base
+              return (
+                <Button key={`mem-${m.key}`} plain onPress={() => void actions.select(m.key)}>
+                  <Text color={MARK_COLOR[m.status]}>{`${fmt.MARKS[m.status]} `}</Text>
+                  <Text bold={m.status !== 'same'}>{m.key.padEnd(keyWidth).slice(0, keyWidth)}</Text>
+                  <Text dimColor>{`  ${snippet ? fmt.wrapLines(snippet, snippetWidth, 1)[0] ?? '' : '(content unavailable)'}`}</Text>
+                </Button>
+              )
+            })
+          )}
+        </Box>
+      )
+      footer = (
+        <Box justifyContent="space-between">
+          <Box gap={3}>
+            <Button key="taxonomy" plain hotkey="t" dimColor onPress={() => void actions.toggleTaxonomy()}>
+              {`taxonomy (${view.showTaxonomy ? 'on' : 'off'})`}
+            </Button>
+            {base !== null && differing.length > 0 ? (
+              <Button key="merge" plain hotkey="p" dimColor onPress={() => void actions.openMerge()}>
+                {`merge to ${base}`}
+              </Button>
+            ) : (
+              []
+            )}
+          </Box>
+          {refreshButton}
+        </Box>
+      )
+    }
+  } else {
+    const charts = fmt.metricCharts(view.metrics, status.branch)
+    const hasRows = charts.some(c => c.rows.length > 0)
+    // One fixed label column across every chart, so the bars line up.
+    const labelWidth = Math.min(24, Math.max(4, ...charts.flatMap(c => c.rows.map(r => r.branch.length))))
+    const valueWidth = Math.max(1, ...charts.flatMap(c => c.rows.map(r => r.label.length)))
+    const barWidth = Math.max(4, width - 2 - labelWidth - 2 - valueWidth)
+    body = !hasRows ? (
+      <Text dimColor>No turn metrics yet. They accumulate after each turn.</Text>
+    ) : (
+      <Box flexDirection="column">
+        {charts.map(chart => {
+          const max = Math.max(0, ...chart.rows.map(r => r.value))
+          return (
+            <Box flexDirection="column" marginBottom={1}>
+              <Text bold>{chart.title}</Text>
+              {chart.rows.map(row => (
+                <Box>
+                  <Text bold={row.isCurrent} dimColor={!row.isCurrent}>
+                    {`${row.isCurrent ? '●' : ' '} ${fmt.wrapLines(row.branch, labelWidth, 1)[0]?.padEnd(labelWidth) ?? ''} `}
+                  </Text>
+                  <Text color={row.isCurrent ? 'claude' : 'inactive'}>{fmt.bar(row.value, max, barWidth).padEnd(barWidth)}</Text>
+                  <Text dimColor>{` ${row.label}`}</Text>
+                </Box>
+              ))}
+            </Box>
+          )
+        })}
+      </Box>
+    )
+    footer = (
+      <Box justifyContent="space-between">
+        <Text dimColor>per branch, from metrics.turn.*</Text>
+        {refreshButton}
+      </Box>
+    )
+  }
+
+  return (
+    <Box flexDirection="column" width={width}>
+      {header}
+      <Box flexDirection="column" marginY={1}>
+        {body}
+      </Box>
+      {footer}
+    </Box>
+  )
+}
